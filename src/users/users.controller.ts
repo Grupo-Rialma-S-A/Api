@@ -10,10 +10,14 @@ import {
   ValidationPipe,
   UsePipes,
   Query,
+  BadRequestException,
 } from '@nestjs/common';
 import { UsersService } from './users.service';
 import { CreateUserDto } from './dto/create-user.dto';
+import { LoginUserDto } from './dto/login-user.dto';
+import { LogoutUserDto } from './dto/logout-user.dto';
 import { UserCreateResponse } from './interfaces/user.interface';
+import { LoginResponse, LogoutResponse } from './interfaces/auth.interface';
 
 @Controller('users')
 export class UsersController {
@@ -47,6 +51,17 @@ export class UsersController {
     } catch (error) {
       this.logger.error('Failed to create user in controller', error);
 
+      if (error instanceof BadRequestException) {
+        throw new HttpException(
+          {
+            success: false,
+            message: error.message,
+            error: 'Validation failed',
+          },
+          HttpStatus.BAD_REQUEST,
+        );
+      }
+
       if (error instanceof HttpException) {
         throw error;
       }
@@ -62,33 +77,127 @@ export class UsersController {
     }
   }
 
-  @Get('exists/:codUsu')
-  async checkUserExists(@Param('codUsu') codUsu: string): Promise<{
-    success: boolean;
-    exists: boolean;
-    userId: string;
-  }> {
+  @Post('login')
+  @UsePipes(new ValidationPipe({ transform: true, whitelist: true }))
+  async loginUser(@Body() loginUserDto: LoginUserDto): Promise<LoginResponse> {
     try {
-      const exists = await this.usersService.getUserExists(codUsu);
+      this.logger.log(`Login request for: ${loginUserDto.email}`);
 
-      return {
-        success: true,
-        exists,
-        userId: codUsu,
-      };
+      const result = await this.usersService.loginUser(loginUserDto);
+
+      this.logger.log(`Login result for ${loginUserDto.email}:`, {
+        success: result.success,
+        result: result.result,
+        message: result.message,
+      });
+
+      if (!result.success) {
+        const statusCode =
+          result.result === 0
+            ? HttpStatus.UNAUTHORIZED
+            : HttpStatus.BAD_REQUEST;
+
+        this.logger.warn(
+          `Login failed for ${loginUserDto.email}: ${result.message} (result: ${result.result})`,
+        );
+
+        throw new HttpException(
+          {
+            success: false,
+            message: result.error || result.message || 'Falha no login',
+            result: result.result,
+          },
+          statusCode,
+        );
+      }
+
+      this.logger.log(`Login successful for: ${loginUserDto.email}`, {
+        success: result.success,
+        result: result.result,
+        message: result.message,
+        userData: result.data,
+      });
+
+      return result;
     } catch (error) {
-      this.logger.error(`Failed to check if user exists: ${codUsu}`, error);
+      this.logger.error(
+        `Failed to login user: ${loginUserDto.email}`,
+        error.stack || error,
+      );
+
+      if (error instanceof HttpException) {
+        throw error;
+      }
 
       throw new HttpException(
         {
           success: false,
-          message: 'Erro ao verificar existência do usuário',
+          message: 'Erro interno do servidor no login',
           error: error.message,
+          result: -1,
         },
         HttpStatus.INTERNAL_SERVER_ERROR,
       );
     }
   }
+
+  @Post('logout')
+  @UsePipes(new ValidationPipe({ transform: true, whitelist: true }))
+  async logoutUser(
+    @Body() logoutUserDto: LogoutUserDto,
+  ): Promise<LogoutResponse> {
+    try {
+      this.logger.log(`Logout request for: ${logoutUserDto.codUsu}`);
+
+      const result = await this.usersService.logoutUser(logoutUserDto);
+
+      if (!result.success) {
+        const statusCode =
+          result.result === 0 ? HttpStatus.NOT_FOUND : HttpStatus.BAD_REQUEST;
+
+        this.logger.warn(
+          `Logout failed for ${logoutUserDto.codUsu}: ${result.message} (result: ${result.result})`,
+        );
+
+        throw new HttpException(
+          {
+            success: false,
+            message: result.error || result.message || 'Falha no logout',
+            result: result.result,
+          },
+          statusCode,
+        );
+      }
+
+      this.logger.log(`Logout successful for: ${logoutUserDto.codUsu}`, {
+        success: result.success,
+        result: result.result,
+        message: result.message,
+      });
+
+      return result;
+    } catch (error) {
+      this.logger.error(
+        `Failed to logout user: ${logoutUserDto.codUsu}`,
+        error.stack || error,
+      );
+
+      if (error instanceof HttpException) {
+        throw error;
+      }
+
+      throw new HttpException(
+        {
+          success: false,
+          message: 'Erro interno do servidor no logout',
+          error: error.message,
+          result: -1,
+        },
+        HttpStatus.INTERNAL_SERVER_ERROR,
+      );
+    }
+  }
+
   @Get(':codUsu')
   async getUserByCode(@Param('codUsu') codUsu: string): Promise<{
     success: boolean;
@@ -129,6 +238,7 @@ export class UsersController {
       );
     }
   }
+
   @Get()
   async getAllUsers(
     @Query('page') page?: string,
@@ -146,7 +256,7 @@ export class UsersController {
       this.logger.log('Getting all users request');
 
       const pageNumber = page ? parseInt(page, 10) : 1;
-      const limitNumber = limit ? parseInt(limit, 10) : 10;
+      const limitNumber = limit ? parseInt(limit, 10) : 30;
 
       if (page && (isNaN(pageNumber) || pageNumber < 1)) {
         throw new HttpException(

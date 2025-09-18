@@ -219,4 +219,58 @@ export class StoredProceduresController {
       );
     }
   }
+
+  @Get('sp-code/:procedureName')
+  async getStoredProcedureCode(
+    @Param('procedureName') procedureName: string,
+  ): Promise<any> {
+    try {
+      this.logger.log(`Getting SP code for: ${procedureName}`);
+
+      const result =
+        await this.storedProceduresService.getStoredProcedureCode(
+          procedureName,
+        );
+
+      return result;
+    } catch (error) {
+      this.logger.error(`Failed to get SP code: ${procedureName}`, error);
+
+      throw new HttpException(
+        {
+          success: false,
+          message: 'Erro ao buscar código da stored procedure',
+          error: error.message,
+        },
+        HttpStatus.INTERNAL_SERVER_ERROR,
+      );
+    }
+  }
+
+  @Get('sp-diagnose/:procedureName')
+  async diagnoseProcedure(
+    @Param('procedureName') procedureName: string,
+  ): Promise<any> {
+    try {
+      this.logger.log(`Diagnosing SP: ${procedureName}`);
+
+      const result =
+        await this.storedProceduresService.diagnoseProcedureAccess(
+          procedureName,
+        );
+
+      return result;
+    } catch (error) {
+      this.logger.error(`Failed to diagnose SP: ${procedureName}`, error);
+
+      throw new HttpException(
+        {
+          success: false,
+          message: 'Erro ao diagnosticar stored procedure',
+          error: error.message,
+        },
+        HttpStatus.INTERNAL_SERVER_ERROR,
+      );
+    }
+  }
 }

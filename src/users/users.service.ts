@@ -2,8 +2,23 @@ import { Injectable, Logger, BadRequestException } from '@nestjs/common';
 import { StoredProceduresService } from '../stored-procedures/stored-procedures.service';
 import { DatabaseService } from '../database/database.service';
 import { CreateUserDto } from './dto/create-user.dto';
+import { LoginUserDto } from './dto/login-user.dto';
+import { LogoutUserDto } from './dto/logout-user.dto';
 import { UserCreateResponse } from './interfaces/user.interface';
-import * as bcrypt from 'bcrypt';
+import { LoginResponse, LogoutResponse } from './interfaces/auth.interface';
+
+import { UserValidator } from '../utils/validation/user-validator.util';
+import { UserDataCleaner } from '../utils/data/user-data-cleaner.util';
+import { UserCodeGenerator } from '../utils/generators/user-code-generator.util';
+import { UserQueryBuilder } from '../utils/query-builders/user-query-builder.util';
+import { StoredProcedureResponseParser } from '../utils/parsers/stored-procedure-parser.util';
+
+interface UserData {
+  codUsu: number;
+  nomeUsu?: string;
+  email?: string;
+  trocarSenha?: boolean;
+}
 
 @Injectable()
 export class UsersService {
@@ -14,125 +29,293 @@ export class UsersService {
     private readonly databaseService: DatabaseService,
   ) {}
 
-  async getStoredProcedureParameters(procedureName: string): Promise<any[]> {
-    try {
-      const query = `
-        SELECT 
-          p.name as parameter_name,
-          p.parameter_id,
-          t.name as data_type,
-          p.max_length,
-          p.precision,
-          p.scale,
-          p.is_output
-        FROM sys.procedures pr
-        INNER JOIN sys.parameters p ON pr.object_id = p.object_id
-        INNER JOIN sys.types t ON p.user_type_id = t.user_type_id
-        WHERE pr.name = @0
-        ORDER BY p.parameter_id
-      `;
+  // ===== AUTENTICAÇÃO VIA STORED PROCEDURES =====
 
-      const result = await this.databaseService.executeQuery(query, [
-        procedureName,
-      ]);
-      this.logger.log(`Parameters for ${procedureName}:`, result);
-      return result;
-    } catch (error) {
-      this.logger.error(
-        `Failed to get procedure parameters for ${procedureName}`,
-        error,
+  async loginUser(loginUserDto: LoginUserDto): Promise<LoginResponse> {
+    try {
+      this.logger.log(`Login attempt for user: ${loginUserDto.email}`);
+
+      UserValidator.validateLoginData(loginUserDto.email, loginUserDto.senha);
+
+      const query = UserQueryBuilder.buildLoginQuery(
+        loginUserDto.email,
+        loginUserDto.senha,
       );
-      throw error;
+
+      this.logger.log('Executing SpLogin');
+      this.logger.log(
+        'Query:',
+        query.replace(loginUserDto.senha, '[PROTECTED]'),
+      );
+
+      const result = await this.databaseService.executeQuery(query);
+      this.logger.log('SpLogin raw result:', JSON.stringify(result, null, 2));
+
+      let loginResult: number;
+      let userData: UserData | null = null;
+
+      if (result && Array.isArray(result) && result.length > 0) {
+        const firstResult = result[0];
+
+        if (firstResult.LoginResult !== undefined) {
+          loginResult = firstResult.LoginResult;
+        } else if (firstResult.CodUsu !== undefined) {
+          loginResult = firstResult.CodUsu;
+          userData = {
+            codUsu: firstResult.CodUsu,
+            nomeUsu: firstResult.NomeUsu?.trim(),
+            email: loginUserDto.email.trim().toLowerCase(),
+            trocarSenha: firstResult.TrocarSenha,
+          };
+          this.logger.log(
+            `SpLogin returned user data directly - CodUsu: ${loginResult}`,
+          );
+        } else {
+          loginResult = -1;
+        }
+      } else {
+        loginResult = -1;
+      }
+
+      this.logger.log(`SpLogin result: ${loginResult}`);
+
+      const isSuccess = loginResult > 0;
+
+      if (isSuccess) {
+        if (!userData) {
+          const userQuery = UserQueryBuilder.buildGetUserDataQuery();
+          const userResult = await this.databaseService.executeQuery(
+            userQuery,
+            [loginResult],
+          );
+
+          userData =
+            userResult && userResult.length > 0
+              ? {
+                  codUsu: userResult[0].CodUsu,
+                  nomeUsu: userResult[0].NomeUsu?.trim(),
+                  email: userResult[0].Email?.trim(),
+                  trocarSenha: userResult[0].TrocarSenha,
+                }
+              : { codUsu: loginResult };
+        }
+
+        const response: LoginResponse = {
+          success: true,
+          message: `Login realizado com sucesso. CodUsu: ${loginResult}`,
+          result: loginResult,
+          data: userData,
+        };
+
+        this.logger.log(
+          `Login successful for: ${loginUserDto.email}, CodUsu: ${loginResult}`,
+        );
+        return response;
+      } else {
+        const message =
+          loginResult === 0
+            ? 'Credenciais inválidas'
+            : 'Erro interno do sistema';
+
+        this.logger.warn(
+          `Login failed for: ${loginUserDto.email}, result: ${loginResult}`,
+        );
+
+        return {
+          success: false,
+          message,
+          result: loginResult,
+        };
+      }
+    } catch (error) {
+      this.logger.error(`Failed to login user: ${loginUserDto.email}`, error);
+
+      return {
+        success: false,
+        error: error.message,
+        result: -1,
+      };
     }
   }
 
-  private async generateUniqueCodUsu(): Promise<number> {
+  async logoutUser(logoutUserDto: LogoutUserDto): Promise<LogoutResponse> {
     try {
-      let attempts = 0;
-      const maxAttempts = 10;
+      this.logger.log(`Logout attempt for user: ${logoutUserDto.codUsu}`);
 
-      while (attempts < maxAttempts) {
-        let codUsu: number;
+      UserValidator.validateLogoutData(logoutUserDto.codUsu);
 
-        if (attempts < 3) {
-          const timestamp = Date.now().toString().slice(-6);
-          codUsu = parseInt(timestamp);
-        } else if (attempts < 6) {
-          const countQuery = `SELECT COUNT(*) as Total FROM Usuario`;
-          const countResult =
-            await this.databaseService.executeQuery(countQuery);
-          const total = countResult[0]?.Total || 0;
-          const base = total + 1000;
-          const random = Math.floor(Math.random() * 1000);
-          codUsu = base + random + attempts;
-        } else {
-          codUsu = Math.floor(Math.random() * 900000) + 100000;
-        }
+      const query = UserQueryBuilder.buildLogoutQuery(logoutUserDto.codUsu);
 
-        codUsu = Math.abs(codUsu);
-        if (codUsu > 2147483647) {
-          codUsu = codUsu % 1000000;
-        }
+      this.logger.log('Executing SpLogout');
+      this.logger.log('Query:', query);
 
-        const exists = await this.getUserExists(codUsu.toString());
-        if (!exists) {
-          this.logger.log(`Generated unique CodUsu: ${codUsu}`);
-          return codUsu;
-        }
+      const result = await this.databaseService.executeQuery(query);
+      this.logger.log('SpLogout raw result:', JSON.stringify(result, null, 2));
 
-        attempts++;
+      const logoutResult =
+        result && result.length > 0 ? result[0].LogoutResult : -1;
+      this.logger.log(`SpLogout result: ${logoutResult}`);
+
+      const isSuccess = logoutResult >= 0;
+
+      if (isSuccess) {
+        this.logger.log(`Logout successful for user: ${logoutUserDto.codUsu}`);
+
+        return {
+          success: true,
+          message: 'Logout realizado com sucesso',
+          result: logoutResult,
+        };
+      } else {
+        const message =
+          logoutResult === 0
+            ? 'Usuário não encontrado'
+            : 'Erro interno do sistema';
+
         this.logger.warn(
-          `CodUsu ${codUsu} already exists, trying again (attempt ${attempts})`,
+          `Logout failed for: ${logoutUserDto.codUsu}, result: ${logoutResult}`,
+        );
+
+        return {
+          success: false,
+          message: message,
+          result: logoutResult,
+        };
+      }
+    } catch (error) {
+      this.logger.error(
+        `Failed to logout user: ${logoutUserDto.codUsu}`,
+        error,
+      );
+
+      return {
+        success: false,
+        error: error.message,
+        result: -1,
+      };
+    }
+  }
+
+  async createUser(createUserDto: CreateUserDto): Promise<UserCreateResponse> {
+    try {
+      this.logger.log(`Creating user: ${createUserDto.email}`);
+
+      // Validação usando utilitário
+      await UserValidator.validateUserData(
+        createUserDto.email,
+        createUserDto.tel,
+        createUserDto.cel,
+        (email) => this.checkEmailExists(email),
+      );
+
+      // Geração de código usando utilitário
+      const generatedCodUsu = await UserCodeGenerator.generateUniqueCodUsu(
+        (code) => this.getUserExists(code),
+        () => this.getUsersCount(),
+      );
+
+      let parameters;
+      try {
+        parameters = await this.getStoredProcedureParameters('SpGrUsuario');
+        this.logger.log('SpGrUsuario parameters:', parameters);
+      } catch (error) {
+        this.logger.warn(
+          'Could not get procedure parameters, trying direct query approach',
+        );
+        return await this.createUserWithDirectQuery(
+          createUserDto,
+          generatedCodUsu,
         );
       }
 
-      throw new Error(
-        'Não foi possível gerar um código único para o usuário após várias tentativas',
+      const procedureParams = [
+        generatedCodUsu,
+        createUserDto.nomeUsu.trim(),
+        createUserDto.email.trim().toLowerCase(),
+        createUserDto.tel?.trim() || null,
+        createUserDto.ramal?.trim() || null,
+        createUserDto.cel?.trim() || null,
+        createUserDto.senha,
+        createUserDto.trocarSenha || 'N',
+      ];
+
+      this.logger.log(
+        `Executing with generated CodUsu=${generatedCodUsu} and parameters:`,
+        procedureParams.map((param, index) =>
+          index === 6 ? '[PROTECTED]' : param,
+        ),
       );
+
+      const result =
+        await this.storedProceduresService.executeStoredProcedureWithParams(
+          'SpGrUsuario',
+          procedureParams,
+        );
+
+      if (result.success) {
+        const response = StoredProcedureResponseParser.parseResponse(
+          result.data,
+        );
+
+        return {
+          success: true,
+          message: response.message || 'Usuário criado com sucesso',
+          data: {
+            ...response.data,
+            codUsu: generatedCodUsu,
+          },
+          userId: generatedCodUsu.toString(),
+          executionTime: result.executionTime,
+        };
+      } else {
+        throw new Error(result.error || 'Falha ao executar SpGrUsuario');
+      }
     } catch (error) {
-      this.logger.error('Failed to generate unique CodUsu', error);
-      throw new Error(`Falha ao gerar código do usuário: ${error.message}`);
+      this.logger.error(`Failed to create user: ${createUserDto.email}`, error);
+
+      if (error instanceof BadRequestException) {
+        throw error;
+      }
+
+      this.logger.log('Falling back to direct query approach');
+      return await this.createUserWithDirectQuery(createUserDto);
     }
   }
 
-  async createUserWithDirectQuery(
+  private async createUserWithDirectQuery(
     createUserDto: CreateUserDto,
+    providedCodUsu?: number,
   ): Promise<UserCreateResponse> {
     try {
       this.logger.log(
         `Creating user with direct query: ${createUserDto.email}`,
       );
 
-      await this.validateUserData(createUserDto);
+      const generatedCodUsu =
+        providedCodUsu ||
+        (await UserCodeGenerator.generateUniqueCodUsu(
+          (code) => this.getUserExists(code),
+          () => this.getUsersCount(),
+        ));
 
-      const generatedCodUsu = await this.generateUniqueCodUsu();
-
-      const hashedPassword = await this.hashPassword(createUserDto.senha);
-
-      const query = `
-      EXEC SpGrUsuario 
-        ${generatedCodUsu},
-        '${createUserDto.nomeUsu.trim().replace(/'/g, "''")}',
-        '${createUserDto.email.trim().toLowerCase()}',
-        ${createUserDto.tel ? `'${createUserDto.tel.trim()}'` : 'NULL'},
-        ${createUserDto.ramal ? `'${createUserDto.ramal.trim()}'` : 'NULL'},
-        ${createUserDto.cel ? `'${createUserDto.cel.trim()}'` : 'NULL'},
-        '${hashedPassword.replace(/'/g, "''")}',
-        '${createUserDto.trocarSenha || 'N'}'
-    `;
+      const query = UserQueryBuilder.buildCreateUserQuery(
+        createUserDto,
+        generatedCodUsu,
+      );
 
       this.logger.log(
         `Executing direct query for user: ${createUserDto.email} with CodUsu: ${generatedCodUsu}`,
       );
-      this.logger.log(`Query: ${query}`);
+      this.logger.log(
+        `Query: ${query.replace(createUserDto.senha, '[PROTECTED]')}`,
+      );
 
       const result = await this.databaseService.executeQuery(query);
-
       this.logger.log(`SpGrUsuario result:`, result);
 
-      const response = this.parseStoredProcedureResponse(result);
+      const response = StoredProcedureResponseParser.parseResponse(result);
 
-      const cleanedData = this.cleanUserData({
+      const cleanedData = UserDataCleaner.cleanUserData({
         ...response.data,
         codUsu: generatedCodUsu,
         nomeUsu: createUserDto.nomeUsu.trim(),
@@ -154,6 +337,10 @@ export class UsersService {
     } catch (error) {
       this.logger.error(`Failed to create user: ${createUserDto.email}`, error);
 
+      if (error instanceof BadRequestException) {
+        throw error;
+      }
+
       return {
         success: false,
         error: error.message,
@@ -162,171 +349,17 @@ export class UsersService {
     }
   }
 
-  async createUser(createUserDto: CreateUserDto): Promise<UserCreateResponse> {
-    try {
-      this.logger.log(`Creating user: ${createUserDto.email}`);
-
-      const generatedCodUsu = await this.generateUniqueCodUsu();
-
-      let parameters;
-      try {
-        parameters = await this.getStoredProcedureParameters('SpGrUsuario');
-        this.logger.log('SpGrUsuario parameters:', parameters);
-      } catch (error) {
-        this.logger.warn(
-          'Could not get procedure parameters, trying direct query approach',
-        );
-        return await this.createUserWithDirectQuery(createUserDto);
-      }
-
-      const procedureParams = [
-        generatedCodUsu,
-        createUserDto.nomeUsu.trim(),
-        createUserDto.email.trim().toLowerCase(),
-        createUserDto.tel?.trim() || null,
-        createUserDto.ramal?.trim() || null,
-        createUserDto.cel?.trim() || null,
-        await this.hashPassword(createUserDto.senha),
-        createUserDto.trocarSenha || 'N',
-      ];
-
-      this.logger.log(
-        `Executing with generated CodUsu=${generatedCodUsu} and parameters:`,
-        procedureParams,
-      );
-
-      const result =
-        await this.storedProceduresService.executeStoredProcedureWithParams(
-          'SpGrUsuario',
-          procedureParams,
-        );
-
-      if (result.success) {
-        const response = this.parseStoredProcedureResponse(result.data);
-
-        return {
-          success: true,
-          message: response.message || 'Usuário criado com sucesso',
-          data: {
-            ...response.data,
-            codUsu: generatedCodUsu,
-          },
-          userId: generatedCodUsu.toString(),
-          executionTime: result.executionTime,
-        };
-      } else {
-        throw new Error(result.error || 'Falha ao executar SpGrUsuario');
-      }
-    } catch (error) {
-      this.logger.error(`Failed to create user: ${createUserDto.email}`, error);
-
-      this.logger.log('Falling back to direct query approach');
-      return await this.createUserWithDirectQuery(createUserDto);
-    }
-  }
-
-  private async validateUserData(createUserDto: CreateUserDto): Promise<void> {
-    const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
-    if (!emailRegex.test(createUserDto.email)) {
-      throw new BadRequestException('Email deve ter um formato válido');
-    }
-
-    if (createUserDto.tel && !/^[\d\s\-\(\)\+]+$/.test(createUserDto.tel)) {
-      throw new BadRequestException(
-        'Telefone deve conter apenas números e caracteres válidos',
-      );
-    }
-
-    if (createUserDto.cel && !/^[\d\s\-\(\)\+]+$/.test(createUserDto.cel)) {
-      throw new BadRequestException(
-        'Celular deve conter apenas números e caracteres válidos',
-      );
-    }
-  }
-
-  private async hashPassword(password: string): Promise<string> {
-    try {
-      const saltRounds = 12;
-      return await bcrypt.hash(password, saltRounds);
-    } catch (error) {
-      this.logger.error('Failed to hash password', error);
-      throw new Error('Falha ao processar senha');
-    }
-  }
-
-  private parseStoredProcedureResponse(data: any): {
-    message?: string;
-    data?: any;
-  } {
-    try {
-      if (Array.isArray(data) && data.length > 0) {
-        const firstResult = data[0];
-
-        if (firstResult.Message || firstResult.message) {
-          return {
-            message: firstResult.Message || firstResult.message,
-            data: firstResult,
-          };
-        }
-
-        if (
-          firstResult.Sucesso !== undefined ||
-          firstResult.sucesso !== undefined
-        ) {
-          const sucesso = firstResult.Sucesso || firstResult.sucesso;
-          return {
-            message: sucesso
-              ? 'Operação realizada com sucesso'
-              : 'Falha na operação',
-            data: firstResult,
-          };
-        }
-
-        return { data: firstResult };
-      }
-
-      if (data && typeof data === 'object') {
-        return {
-          message:
-            data.Message || data.message || 'Operação realizada com sucesso',
-          data: data,
-        };
-      }
-
-      return { message: 'Usuário processado com sucesso' };
-    } catch (error) {
-      this.logger.warn('Failed to parse stored procedure response', error);
-      return { message: 'Usuário processado com sucesso' };
-    }
-  }
-
   async getUserByCode(codUsu: string): Promise<any> {
     try {
       this.logger.log(`Searching for user: ${codUsu}`);
 
-      const query = `
-      SELECT 
-        CodUsu,
-        NomeUsu,
-        Email,
-        Tel,
-        Ramal,
-        Cel,
-        TrocarSenha,
-        DataInc,
-        DataAlt,
-        DataBloqueado,
-        Logado
-      FROM Usuario 
-      WHERE CodUsu = @0
-    `;
-
+      const query = UserQueryBuilder.buildGetUserQuery();
       const result = await this.databaseService.executeQuery(query, [
         codUsu.trim(),
       ]);
 
       if (result && result.length > 0) {
-        const cleanedData = this.cleanUserData(result[0]);
+        const cleanedData = UserDataCleaner.cleanUserData(result[0]);
 
         this.logger.log(`User found: ${codUsu}`);
         return {
@@ -348,30 +381,6 @@ export class UsersService {
     }
   }
 
-  async getUserExists(codUsu: string): Promise<boolean> {
-    try {
-      this.logger.log(`Checking if user exists: ${codUsu}`);
-
-      const query = `
-      SELECT COUNT(*) as UserCount
-      FROM Usuario 
-      WHERE CodUsu = @0
-    `;
-
-      const result = await this.databaseService.executeQuery(query, [
-        codUsu.trim(),
-      ]);
-
-      const exists = result && result.length > 0 && result[0].UserCount > 0;
-
-      this.logger.log(`User exists check for ${codUsu}: ${exists}`);
-      return exists;
-    } catch (error) {
-      this.logger.warn(`Failed to check if user exists: ${codUsu}`, error);
-      return false;
-    }
-  }
-
   async getAllUsers(
     page?: number,
     limit?: number,
@@ -387,60 +396,16 @@ export class UsersService {
     try {
       this.logger.log('Getting all users');
 
-      let query = `
-      SELECT 
-        CodUsu,
-        NomeUsu,
-        Email,
-        Tel,
-        Ramal,
-        Cel,
-        TrocarSenha,
-        DataInc,
-        DataAlt,
-        DataBloqueado,
-        Logado
-      FROM Usuario
-    `;
-
-      const queryParams: any[] = [];
-      let paramIndex = 0;
-
-      if (search && search.trim()) {
-        query += ` WHERE (CodUsu LIKE @${paramIndex} OR NomeUsu LIKE @${paramIndex + 1} OR Email LIKE @${paramIndex + 2})`;
-        const searchTerm = `%${search.trim()}%`;
-        queryParams.push(searchTerm, searchTerm, searchTerm);
-        paramIndex += 3;
-      }
-
-      query += ` ORDER BY NomeUsu ASC`;
-
-      if (page && limit) {
-        const offset = (page - 1) * limit;
-        query += ` OFFSET @${paramIndex} ROWS FETCH NEXT @${paramIndex + 1} ROWS ONLY`;
-        queryParams.push(offset, limit);
-      }
+      const { query, params, countQuery, countParams } =
+        UserQueryBuilder.buildGetAllUsersQuery(search, page, limit);
 
       this.logger.log(`Executing query: ${query}`);
-      this.logger.log(`Query params:`, queryParams);
+      this.logger.log(`Query params:`, params);
 
-      const result = await this.databaseService.executeQuery(
-        query,
-        queryParams,
-      );
+      const result = await this.databaseService.executeQuery(query, params);
 
       let total = 0;
-
-      if (page && limit) {
-        let countQuery = `SELECT COUNT(*) as Total FROM Usuario`;
-        const countParams: any[] = [];
-
-        if (search && search.trim()) {
-          countQuery += ` WHERE (CodUsu LIKE @0 OR NomeUsu LIKE @1 OR Email LIKE @2)`;
-          const searchTerm = `%${search.trim()}%`;
-          countParams.push(searchTerm, searchTerm, searchTerm);
-        }
-
+      if (page && limit && countQuery && countParams) {
         const countResult = await this.databaseService.executeQuery(
           countQuery,
           countParams,
@@ -448,7 +413,7 @@ export class UsersService {
         total = countResult[0]?.Total || 0;
       }
 
-      const cleanedData = this.cleanUserData(result || []);
+      const cleanedData = UserDataCleaner.cleanUserData(result || []);
 
       this.logger.log(`Found ${result?.length || 0} users`);
 
@@ -466,30 +431,72 @@ export class UsersService {
     }
   }
 
-  private cleanUserData(userData: any): any {
-    if (!userData) return userData;
+  async checkEmailExists(email: string): Promise<boolean> {
+    try {
+      this.logger.log(`Checking if email exists: ${email}`);
 
-    if (Array.isArray(userData)) {
-      return userData.map((user) => this.cleanUserData(user));
+      const query = UserQueryBuilder.buildCheckEmailExistsQuery();
+      const result = await this.databaseService.executeQuery(query, [
+        email.trim().toLowerCase(),
+      ]);
+
+      this.logger.log(`Email check query result:`, result);
+
+      const exists = result && result.length > 0 && result[0].EmailCount > 0;
+      this.logger.log(`Email exists check for ${email}: ${exists}`);
+
+      return exists;
+    } catch (error) {
+      this.logger.warn(`Failed to check if email exists: ${email}`, error);
+      return false;
     }
+  }
 
-    const cleaned = { ...userData };
+  async getUserExists(codUsu: string): Promise<boolean> {
+    try {
+      this.logger.log(`Checking if user exists: ${codUsu}`);
 
-    const stringFields = [
-      'NomeUsu',
-      'Email',
-      'Tel',
-      'Ramal',
-      'Cel',
-      'TrocarSenha',
-    ];
+      const query = UserQueryBuilder.buildCheckUserExistsQuery();
+      const result = await this.databaseService.executeQuery(query, [
+        codUsu.trim(),
+      ]);
 
-    stringFields.forEach((field) => {
-      if (cleaned[field] && typeof cleaned[field] === 'string') {
-        cleaned[field] = cleaned[field].trim();
-      }
-    });
+      const exists = result && result.length > 0 && result[0].UserCount > 0;
+      this.logger.log(`User exists check for ${codUsu}: ${exists}`);
 
-    return cleaned;
+      return exists;
+    } catch (error) {
+      this.logger.warn(`Failed to check if user exists: ${codUsu}`, error);
+      return false;
+    }
+  }
+
+  async getStoredProcedureParameters(procedureName: string): Promise<any[]> {
+    try {
+      const query = UserQueryBuilder.buildGetStoredProcedureParametersQuery();
+      const result = await this.databaseService.executeQuery(query, [
+        procedureName,
+      ]);
+
+      this.logger.log(`Parameters for ${procedureName}:`, result);
+      return result;
+    } catch (error) {
+      this.logger.error(
+        `Failed to get procedure parameters for ${procedureName}`,
+        error,
+      );
+      throw error;
+    }
+  }
+
+  private async getUsersCount(): Promise<number> {
+    try {
+      const query = UserQueryBuilder.buildGetUsersCountQuery();
+      const result = await this.databaseService.executeQuery(query);
+      return result[0]?.Total || 0;
+    } catch (error) {
+      this.logger.warn('Failed to get users count', error);
+      return 0;
+    }
   }
 }
