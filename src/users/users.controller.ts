@@ -11,13 +11,22 @@ import {
   UsePipes,
   Query,
   BadRequestException,
+  UseGuards,
+  Request,
 } from '@nestjs/common';
 import { UsersService } from './users.service';
 import { CreateUserDto } from './dto/create-user.dto';
 import { LoginUserDto } from './dto/login-user.dto';
 import { LogoutUserDto } from './dto/logout-user.dto';
+
 import { UserCreateResponse } from './interfaces/user.interface';
-import { LoginResponse, LogoutResponse } from './interfaces/auth.interface';
+import {
+  LoginResponse,
+  LogoutResponse,
+  // RefreshTokenResponse,
+} from './interfaces/auth.interface';
+import { JwtAuthGuard } from 'src/guards/jwt-auth.guard';
+import { RefreshTokenDto } from 'src/token/dto/refresh-token.dto';
 
 @Controller('users')
 export class UsersController {
@@ -89,6 +98,7 @@ export class UsersController {
         success: result.success,
         result: result.result,
         message: result.message,
+        hasTokens: !!result.tokens,
       });
 
       if (!result.success) {
@@ -116,6 +126,7 @@ export class UsersController {
         result: result.result,
         message: result.message,
         userData: result.data,
+        tokenType: result.tokens?.tokenType,
       });
 
       return result;
@@ -145,9 +156,22 @@ export class UsersController {
   @UsePipes(new ValidationPipe({ transform: true, whitelist: true }))
   async logoutUser(
     @Body() logoutUserDto: LogoutUserDto,
+    @Request() req: any,
   ): Promise<LogoutResponse> {
     try {
       this.logger.log(`Logout request for: ${logoutUserDto.codUsu}`);
+
+      // Verifica se o usuário logado pode fazer logout apenas de si mesmo
+      // if (req.user.codUsu !== logoutUserDto.codUsu) {
+      //   throw new HttpException(
+      //     {
+      //       success: false,
+      //       message: 'Você só pode fazer logout da sua própria conta',
+      //       result: -1,
+      //     },
+      //     HttpStatus.FORBIDDEN,
+      //   );
+      // }
 
       const result = await this.usersService.logoutUser(logoutUserDto);
 
@@ -198,7 +222,111 @@ export class UsersController {
     }
   }
 
+  @Post('refresh-token')
+  @UsePipes(new ValidationPipe({ transform: true, whitelist: true }))
+  async refreshToken(@Body() refreshTokenDto: RefreshTokenDto): Promise<any> {
+    try {
+      this.logger.log(
+        `Refresh token request received for user: ${refreshTokenDto.codUser}`,
+      );
+
+      const result = await this.usersService.refreshTokens(refreshTokenDto);
+
+      if (!result.success) {
+        this.logger.warn(
+          `Token refresh failed for user: ${refreshTokenDto.codUser}: ${result.error}`,
+        );
+
+        // Se logout é necessário, retorna status UNAUTHORIZED
+        const statusCode = result.logout
+          ? HttpStatus.UNAUTHORIZED
+          : HttpStatus.BAD_REQUEST;
+
+        throw new HttpException(
+          {
+            success: false,
+            message: result.error || 'Falha ao atualizar token',
+            logout: result.logout,
+          },
+          statusCode,
+        );
+      }
+
+      this.logger.log(
+        `Token refresh successful for user: ${refreshTokenDto.codUser}`,
+      );
+      return result;
+    } catch (error) {
+      this.logger.error(
+        `Failed to refresh token for user: ${refreshTokenDto.codUser}`,
+        error.stack || error,
+      );
+
+      if (error instanceof HttpException) {
+        throw error;
+      }
+
+      throw new HttpException(
+        {
+          success: false,
+          message: 'Erro interno do servidor ao atualizar token',
+          error: error.message,
+          logout: true, // Força logout em erros inesperados
+        },
+        HttpStatus.INTERNAL_SERVER_ERROR,
+      );
+    }
+  }
+
+  @Get('profile')
+  @UseGuards(JwtAuthGuard)
+  async getUserProfile(@Request() req: any): Promise<{
+    success: boolean;
+    data?: any;
+    message: string;
+  }> {
+    try {
+      this.logger.log(`Getting profile for user: ${req.user.codUsu}`);
+
+      const result = await this.usersService.getUserByCode(
+        req.user.codUsu.toString(),
+      );
+
+      if (!result.success) {
+        throw new HttpException(
+          {
+            success: false,
+            message: result.message,
+            data: null,
+          },
+          HttpStatus.NOT_FOUND,
+        );
+      }
+
+      return result;
+    } catch (error) {
+      this.logger.error(
+        `Failed to get profile for user: ${req.user?.codUsu}`,
+        error,
+      );
+
+      if (error instanceof HttpException) {
+        throw error;
+      }
+
+      throw new HttpException(
+        {
+          success: false,
+          message: 'Erro interno do servidor ao buscar perfil',
+          error: error.message,
+        },
+        HttpStatus.INTERNAL_SERVER_ERROR,
+      );
+    }
+  }
+
   @Get(':codUsu')
+  @UseGuards(JwtAuthGuard)
   async getUserByCode(@Param('codUsu') codUsu: string): Promise<{
     success: boolean;
     data?: any;
@@ -240,6 +368,7 @@ export class UsersController {
   }
 
   @Get()
+  @UseGuards(JwtAuthGuard)
   async getAllUsers(
     @Query('page') page?: string,
     @Query('limit') limit?: string,

@@ -5,6 +5,7 @@ import {
   MaxLength,
   MinLength,
   Matches,
+  IsNumber,
 } from 'class-validator';
 
 export class CreateUserDto {
@@ -41,4 +42,8 @@ export class CreateUserDto {
   @IsString()
   @Matches(/^[SN]$/, { message: 'TrocarSenha deve ser S ou N' })
   trocarSenha?: string = 'N';
+
+  @IsOptional()
+  @IsString()
+  codGrupoUsu?: string;
 }

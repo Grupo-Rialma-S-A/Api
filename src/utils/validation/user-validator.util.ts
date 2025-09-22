@@ -1,7 +1,3 @@
-// ========================================
-// src/utils/validation/user-validator.util.ts
-// ========================================
-
 import { BadRequestException } from '@nestjs/common';
 
 export class UserValidator {
@@ -26,8 +22,8 @@ export class UserValidator {
     }
   }
 
-  static validateCodUsu(codUsu: string): void {
-    if (!codUsu || codUsu.trim().length === 0) {
+  static validateCodUsu(codUsu: number): void {
+    if (!codUsu || codUsu <= 0) {
       throw new BadRequestException('CodUsu é obrigatório');
     }
   }
@@ -37,7 +33,7 @@ export class UserValidator {
     this.validatePassword(senha);
   }
 
-  static validateLogoutData(codUsu: string): void {
+  static validateLogoutData(codUsu: number): void {
     this.validateCodUsu(codUsu);
   }
 
@@ -65,5 +61,48 @@ export class UserValidator {
     if (cel) {
       this.validatePhone(cel, 'Celular');
     }
+  }
+
+  /**
+   * Valida se o usuário existe antes do login
+   */
+  static async validateUserExistsForLogin(
+    email: string,
+    checkUserExistsFn: (email: string) => Promise<boolean>,
+  ): Promise<void> {
+    const userExists = await checkUserExistsFn(email);
+    if (!userExists) {
+      throw new BadRequestException('Usuário não encontrado');
+    }
+  }
+}
+
+export class UserQueryBuilder {
+  static buildLoginQuery(email: string, senha: string): string {
+    return `
+      DECLARE @Result INT;
+      EXEC @Result = SpLogin 
+        '${email.trim().toLowerCase().replace(/'/g, "''")}',
+        '${senha.replace(/'/g, "''")}';
+      SELECT @Result AS LoginResult;
+    `;
+  }
+
+  /**
+   * Query para verificar se usuário existe usando SpSeUsuario
+   */
+  static buildCheckUserExistsQuery(): string {
+    return `
+      DECLARE @NomeUsu varchar(100) = '';
+      EXEC SpSeUsuario @NomeUsu
+    `;
+  }
+
+  static buildGetUserDataQuery(): string {
+    return `
+      SELECT CodUsu, NomeUsu, Email, TrocarSenha 
+      FROM Usuario 
+      WHERE CodUsu = ?
+    `;
   }
 }

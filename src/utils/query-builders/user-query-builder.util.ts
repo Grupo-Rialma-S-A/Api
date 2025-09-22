@@ -70,10 +70,10 @@ export class UserQueryBuilder {
     `;
   }
 
-  static buildLogoutQuery(codUsu: string): string {
+  static buildLogoutQuery(codUsu: number): string {
     return `
       DECLARE @Result INT;
-      EXEC @Result = SpLogout '${codUsu.trim().replace(/'/g, "''")}';
+      EXEC @Result = SpLogout ${codUsu};
       SELECT @Result AS LogoutResult;
     `;
   }
@@ -136,6 +136,26 @@ export class UserQueryBuilder {
         TrocarSenha
       FROM Usuario 
       WHERE CodUsu = @0
+    `;
+  }
+
+  /**
+   * Query para verificar se usuário existe usando SpSeUsuario
+   */
+  static buildCheckUserExistsForLoginQuery(): string {
+    return `
+      DECLARE @NomeUsu varchar(100) = '';
+      EXEC SpSeUsuario @NomeUsu
+    `;
+  }
+
+  /**
+   * Query para verificar dados específicos do usuário usando SpSe1Usuario
+   */
+  static buildGetUserByIdQuery(codUsu: number): string {
+    return `
+      DECLARE @CodUsu int = ${codUsu};
+      EXEC SpSe1Usuario @CodUsu
     `;
   }
 

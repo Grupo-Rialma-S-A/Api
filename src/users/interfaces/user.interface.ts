@@ -1,3 +1,4 @@
+// interfaces/user.interface.ts
 export interface CreateUserDto {
   codUsu: string; // @CodUsu - char(20)
   nomeUsu: string; // @NomeUsu - varchar(100)
@@ -7,6 +8,7 @@ export interface CreateUserDto {
   cel?: string; // @Cel - char(20) - opcional
   senha: string; // @Senha - nvarchar(128)
   trocarSenha?: string; // @TrocarSenha - char(1) - opcional (S/N)
+  codGrupoUsu?: number; // @CodGrupoUsu - int - opcional
 }
 
 export interface User {
@@ -17,6 +19,10 @@ export interface User {
   ramal?: string;
   cel?: string;
   trocarSenha?: string;
+  codGrupoUsu?: number;
+  accessToken?: string;
+  resetToken?: string;
+  tokenUpdatedAt?: Date;
   createdAt?: Date;
   updatedAt?: Date;
 }
