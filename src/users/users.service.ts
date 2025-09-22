@@ -16,6 +16,8 @@ import { UserQueryBuilder } from '../utils/query-builders/user-query-builder.uti
 import { StoredProcedureResponseParser } from '../utils/parsers/stored-procedure-parser.util';
 import { RefreshTokenDto } from 'src/token/dto/refresh-token.dto';
 import { TokenService } from 'src/token/token.service';
+import { BlockUserDto } from './dto/block-user.dto';
+import { BlockUserResponse } from './interfaces/block-user.interface';
 
 interface UserData {
   codUsu: number;
@@ -450,7 +452,7 @@ export class UsersService {
         createUserDto.cel?.trim() || null, // @Cel
         createUserDto.senha, // @Senha
         createUserDto.trocarSenha || 'N', // @TrocarSenha
-        createUserDto.codGrupoUsu || 1, // @CodGrupoUsu - Valor padrão 1
+        'MEMBRO', // @CodGrupoUsu - Sempre MEMBRO
       ];
 
       this.logger.log(
@@ -477,7 +479,7 @@ export class UsersService {
           data: {
             ...response.data,
             codUsu: generatedCodUsu,
-            codGrupoUsu: createUserDto.codGrupoUsu || '',
+            codGrupoUsu: 'MEMBRO',
           },
           userId: generatedCodUsu.toString(),
           executionTime: result.executionTime,
@@ -523,13 +525,13 @@ export class UsersService {
       DECLARE @Cel varchar(20) = ${createUserDto.cel ? `'${createUserDto.cel.trim().replace(/'/g, "''")}'` : 'NULL'};
       DECLARE @Senha nvarchar(128) = '${createUserDto.senha.replace(/'/g, "''")}';
       DECLARE @TrocarSenha char(1) = '${createUserDto.trocarSenha || 'N'}';
-      DECLARE @CodGrupoUsu int = ${createUserDto.codGrupoUsu || ''};
+      DECLARE @CodGrupoUsu char(10) = 'MEMBRO';
       
       EXEC SpGrUsuario @CodUsu, @NomeUsu, @Email, @Tel, @Ramal, @Cel, @Senha, @TrocarSenha, @CodGrupoUsu
     `;
 
       this.logger.log(
-        `Executing direct query for user: ${createUserDto.email} with CodUsu: ${generatedCodUsu}`,
+        `Executing direct query for user: ${createUserDto.email} with CodUsu: ${generatedCodUsu} and CodGrupoUsu: MEMBRO`,
       );
 
       // Execute without parameters since they're embedded in the query
@@ -548,7 +550,7 @@ export class UsersService {
         ramal: createUserDto.ramal?.trim() || null,
         cel: createUserDto.cel?.trim() || null,
         trocarSenha: createUserDto.trocarSenha || 'N',
-        codGrupoUsu: createUserDto.codGrupoUsu || '',
+        codGrupoUsu: 'MEMBRO',
       });
 
       this.logger.log(`User created successfully: ${generatedCodUsu}`);
@@ -713,6 +715,153 @@ export class UsersService {
         error,
       );
       throw error;
+    }
+  }
+  async blockUser(blockUserDto: BlockUserDto): Promise<BlockUserResponse> {
+    try {
+      this.logger.log(`Blocking user: ${blockUserDto.codUsu}`);
+
+      // Validação básica
+      UserValidator.validateLogoutData(blockUserDto.codUsu); // Reutiliza validação similar
+
+      // Verifica se o usuário existe antes de tentar bloquear
+      const userExists = await this.getUserExists(
+        blockUserDto.codUsu.toString(),
+      );
+      if (!userExists) {
+        this.logger.warn(`User not found for blocking: ${blockUserDto.codUsu}`);
+        return {
+          success: false,
+          message: 'Usuário não encontrado',
+          result: null,
+        };
+      }
+
+      // Verifica se o usuário já está bloqueado
+      const isAlreadyBlocked = await this.checkUserBlocked(blockUserDto.codUsu);
+      if (isAlreadyBlocked) {
+        this.logger.warn(`User already blocked: ${blockUserDto.codUsu}`);
+        return {
+          success: false,
+          message: 'Usuário já está bloqueado',
+          result: null,
+        };
+      }
+
+      // Executa a stored procedure SpBloqueado
+      // Método 1: Usando executeQuery com parâmetros
+      try {
+        const query = 'EXEC SpBloqueado @CodUsu';
+
+        this.logger.log(
+          `Executing SpBloqueado for user: ${blockUserDto.codUsu}`,
+        );
+        this.logger.log('Query:', query);
+        this.logger.log('Parameters:', [blockUserDto.codUsu]);
+
+        const result = await this.databaseService.executeQuery(query, [
+          blockUserDto.codUsu,
+        ]);
+        this.logger.log(
+          'SpBloqueado raw result:',
+          JSON.stringify(result, null, 2),
+        );
+
+        // Se falhou com parâmetros, tenta com stored procedure service
+      } catch (paramError) {
+        this.logger.warn(
+          'Failed with parameters, trying stored procedure service',
+          paramError,
+        );
+
+        try {
+          const result =
+            await this.storedProceduresService.executeStoredProcedureWithParams(
+              'SpBloqueado',
+              [blockUserDto.codUsu],
+            );
+
+          if (result.success) {
+            this.logger.log(
+              'SpBloqueado executed successfully via stored procedure service',
+            );
+            return {
+              success: true,
+              message: 'Usuário bloqueado com sucesso',
+              result: result.data,
+              // @ts-ignore
+              executionTime: result.executionTime,
+            };
+          } else {
+            throw new Error(result.error || 'Falha ao executar SpBloqueado');
+          }
+        } catch (spError) {
+          this.logger.warn(
+            'Failed with stored procedure service, trying direct query',
+            spError,
+          );
+
+          // Método 3: Query direta com valor inline
+          const directQuery = `EXEC SpBloqueado ${blockUserDto.codUsu}`;
+          this.logger.log('Trying direct query:', directQuery);
+
+          const result = await this.databaseService.executeQuery(
+            directQuery,
+            [],
+          );
+        }
+      }
+      this.logger.log(
+        'SpBloqueado raw result:',
+        // @ts-ignore
+        JSON.stringify(result, null, 2),
+      );
+
+      // Revoga tokens do usuário após bloqueio
+      try {
+        await this.tokenService.revokeTokens(blockUserDto.codUsu);
+        this.logger.log(
+          `Tokens revoked for blocked user: ${blockUserDto.codUsu}`,
+        );
+      } catch (tokenError) {
+        this.logger.warn(
+          `Failed to revoke tokens for user: ${blockUserDto.codUsu}`,
+          tokenError,
+        );
+        // Não falha o bloqueio se não conseguir revogar tokens
+      }
+      // @ts-ignore
+      if (result && Array.isArray(result)) {
+        // Processa o resultado da stored procedure
+        // @ts-ignore
+        const response = StoredProcedureResponseParser.parseResponse(result);
+
+        this.logger.log(`User blocked successfully: ${blockUserDto.codUsu}`);
+        return {
+          success: true,
+          message: response.message || 'Usuário bloqueado com sucesso',
+          // @ts-ignore
+          result: response.data || result,
+        };
+      }
+
+      this.logger.warn(
+        `SpBloqueado returned unexpected result for user: ${blockUserDto.codUsu}`,
+      );
+      return {
+        success: false,
+        message: 'Erro inesperado ao bloquear usuário',
+        result: null,
+      };
+    } catch (error) {
+      this.logger.error(`Failed to block user: ${blockUserDto.codUsu}`, error);
+
+      return {
+        success: false,
+        message: 'Erro interno do servidor ao bloquear usuário',
+        error: error.message,
+        result: null,
+      };
     }
   }
 

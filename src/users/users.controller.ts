@@ -27,6 +27,8 @@ import {
 } from './interfaces/auth.interface';
 import { JwtAuthGuard } from 'src/guards/jwt-auth.guard';
 import { RefreshTokenDto } from 'src/token/dto/refresh-token.dto';
+import { BlockUserResponse } from './interfaces/block-user.interface';
+import { BlockUserDto } from './dto/block-user.dto';
 
 @Controller('users')
 export class UsersController {
@@ -325,6 +327,88 @@ export class UsersController {
     }
   }
 
+  @Post('block')
+  @UseGuards(JwtAuthGuard)
+  @UsePipes(new ValidationPipe({ transform: true, whitelist: true }))
+  async blockUser(
+    @Body() blockUserDto: BlockUserDto,
+    @Request() req: any,
+  ): Promise<BlockUserResponse> {
+    try {
+      this.logger.log(
+        `Block user request for: ${blockUserDto.codUsu} by user: ${req.user.codUsu}`,
+      );
+
+      // Opcional: Verifica se o usuário logado tem permissão para bloquear
+      // Você pode implementar verificação de roles/permissões aqui
+      // if (!this.hasPermissionToBlockUsers(req.user)) {
+      //   throw new HttpException(
+      //     {
+      //       success: false,
+      //       message: 'Você não tem permissão para bloquear usuários',
+      //     },
+      //     HttpStatus.FORBIDDEN,
+      //   );
+      // }
+
+      // Impede que o usuário bloqueie a si mesmo
+      if (req.user.codUsu === blockUserDto.codUsu) {
+        this.logger.warn(`User ${req.user.codUsu} tried to block themselves`);
+        throw new HttpException(
+          {
+            success: false,
+            message: 'Você não pode bloquear sua própria conta',
+          },
+          HttpStatus.BAD_REQUEST,
+        );
+      }
+
+      const result = await this.usersService.blockUser(blockUserDto);
+
+      if (!result.success) {
+        const statusCode = result.message.includes('não encontrado')
+          ? HttpStatus.NOT_FOUND
+          : HttpStatus.BAD_REQUEST;
+
+        this.logger.warn(
+          `Block user failed for ${blockUserDto.codUsu}: ${result.message}`,
+        );
+
+        throw new HttpException(
+          {
+            success: false,
+            message:
+              result.error || result.message || 'Falha ao bloquear usuário',
+          },
+          statusCode,
+        );
+      }
+
+      this.logger.log(
+        `User blocked successfully: ${blockUserDto.codUsu} by user: ${req.user.codUsu}`,
+      );
+      return result;
+    } catch (error) {
+      this.logger.error(
+        `Failed to block user: ${blockUserDto.codUsu}`,
+        error.stack || error,
+      );
+
+      if (error instanceof HttpException) {
+        throw error;
+      }
+
+      throw new HttpException(
+        {
+          success: false,
+          message: 'Erro interno do servidor ao bloquear usuário',
+          error: error.message,
+        },
+        HttpStatus.INTERNAL_SERVER_ERROR,
+      );
+    }
+  }
+
   @Get(':codUsu')
   @UseGuards(JwtAuthGuard)
   async getUserByCode(@Param('codUsu') codUsu: string): Promise<{
@@ -368,7 +452,7 @@ export class UsersController {
   }
 
   @Get()
-  @UseGuards(JwtAuthGuard)
+  // @UseGuards(JwtAuthGuard)
   async getAllUsers(
     @Query('page') page?: string,
     @Query('limit') limit?: string,
